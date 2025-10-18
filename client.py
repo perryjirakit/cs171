@@ -1,121 +1,139 @@
-
+#!/usr/bin/env python3
 import argparse
 import json
+import math
 import socket
 import time
-import csv
-import math
-import sys
-from typing import Tuple
+from pathlib import Path
 
-def now() -> float:
-    return time.time()
+NW_HOST_DEFAULT = "127.0.0.1"
+NW_PORT_DEFAULT = 5001
 
-class LocalClock:
+# ---------- Local clock with drift ----------
+class DriftClock:
     """
-    Local clock with drift rho (unitless ratio). Uses base anchors (Rbase, Lbase).
-    L(t) = Lbase + (R(t) - Rbase) * (1 + rho)
+    Local clock L(t) = Lbase + (R(t) - Rbase) * (1 + rho),
+    where R(t) is real process time (Unix epoch seconds).
     """
     def __init__(self, rho: float):
-        self.rho = rho
-        rt = now()
-        self.Rbase = rt
-        self.Lbase = rt  # start with no offset
-        self.last_sync_wall = rt
+        self.rho = float(rho)
+        now = time.time()
+        self.Lbase = now
+        self.Rbase = now
 
-    def read(self) -> float:
-        rt = now()
-        return self.Lbase + (rt - self.Rbase) * (1.0 + self.rho)
+    def now(self) -> float:
+        R = time.time()
+        return self.Lbase + (R - self.Rbase) * (1.0 + self.rho)
 
-    def sync_cristian(self, nw_host: str, nw_port: int) -> Tuple[float, float, float]:
-        """
-        Perform a Cristian sync via the NW proxy to the time server.
-        Returns (server_time, rtt, offset_applied).
-        """
-        t0 = now()
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((nw_host, nw_port))
-            msg = {"type": "time_req"}
-            s.sendall(json.dumps(msg).encode("utf-8"))
-            data = s.recv(4096)
-        t1 = now()
+    def set(self, new_local_time: float):
+        """Reset bases so that L(now) == new_local_time."""
+        self.Rbase = time.time()
+        self.Lbase = float(new_local_time)
 
-        resp = json.loads(data.decode("utf-8"))
-        Ts = float(resp["server_time"])
+# ---------- Cristian sync ----------
+def cristian_sync(nw_host: str, nw_port: int) -> tuple[float, float]:
+    """
+    Perform one sync round via the NW proxy.
+    Returns:
+        (server_time, rtt_seconds)
+    """
+    t0 = time.time()
+    req = {"type": "time_req"}
+    data = (json.dumps(req) + "\n").encode("utf-8")
 
-        rtt = t1 - t0  # processing time is assumed zero at server
-        # Cristian's estimate of server time at arrival: Ts + rtt/2
-        est_server_at_arrival = Ts + rtt / 2.0
+    with socket.create_connection((nw_host, nw_port), timeout=2.0) as sock:
+        sock.sendall(data)
+        f = sock.makefile("rb")
+        line = f.readline()
+        if not line:
+            raise RuntimeError("Empty response from time server")
+        resp = json.loads(line.decode("utf-8"))
 
-        # Our current real time is t1. We want L(t1) = est_server_at_arrival
-        # Solve for new bases: set Rbase = t1, Lbase = est_server_at_arrival
-        new_Rbase = t1
-        new_Lbase = est_server_at_arrival
+    t2 = time.time()
+    if resp.get("type") != "time_resp" or "server_time" not in resp:
+        raise RuntimeError("Malformed response from time server")
+    ts = float(resp["server_time"])
+    rtt = t2 - t0
+    return ts, rtt
 
-        # Compute current local time before adjustment to report applied offset
-        before = self.read()
-        self.Rbase = new_Rbase
-        self.Lbase = new_Lbase
-        self.last_sync_wall = t1
-        after = self.read()
+def next_interval_seconds(epsilon_max: float, rtt: float, rho: float) -> float:
+    """
+    Keep error ≤ εmax:
+      immediate post-sync error ≤ rtt/2
+      drift after Δ seconds adds |rho|*Δ
+      rtt/2 + |rho|*Δ ≤ εmax  =>  Δ ≤ (εmax - rtt/2)/|rho|
+    """
+    delta = rtt / 2.0
+    margin = epsilon_max - delta
+    if margin <= 0:
+        # Network alone exceeds epsilon; retry very soon
+        return 0.5
+    if abs(rho) < 1e-18:
+        # Essentially perfect local clock; still sync occasionally
+        return min(60.0, margin / 1e-12)
+    return max(0.5, margin / abs(rho))
 
-        return Ts, rtt, (after - before)
+def write_csv_row(csv_path: Path, actual_time: float, local_time: float, header_written: list):
+    if not header_written[0]:
+        csv_path.write_text("actual_time,local_time\n", encoding="utf-8")
+        header_written[0] = True
+    with csv_path.open("a", encoding="utf-8") as f:
+        f.write(f"{actual_time:.3f},{local_time:.3f}\n")
 
-    def drift_error_bound(self) -> float:
-        """Estimated absolute drift error since last sync from drift alone."""
-        dt = now() - self.last_sync_wall
-        return abs(self.rho) * dt
+def main():
+    p = argparse.ArgumentParser(description="Cristian's algorithm client with drift and CSV logging.")
+    p.add_argument("--d", type=int, required=True, help="Duration to run (seconds)")
+    p.add_argument("--epsilon", type=float, required=True, help="Maximum tolerable error εmax (seconds)")
+    p.add_argument("--rho", type=float, required=True, help="Clock drift ρ (e.g., 2e-6)")
+    p.add_argument("--csv", type=str, default="output.csv", help="CSV output file")
+    p.add_argument("--nw_host", type=str, default=NW_HOST_DEFAULT, help="Network proxy host")
+    p.add_argument("--nw_port", type=int, default=NW_PORT_DEFAULT, help="Network proxy port")
+    args = p.parse_args()
 
-def run_client(d: int, epsilon_max: float, rho: float, nw_host: str, nw_port: int, out_csv: str):
-    clk = LocalClock(rho=rho)
+    clock = DriftClock(args.rho)
+    csv_path = Path(args.csv)
+    if csv_path.exists():
+        csv_path.unlink()
+    header_written = [False]
 
-    # Immediately perform an initial sync to align with server at start
+    start = time.time()
+    end = start + args.d
+
+    # Initial sync asap
     try:
-        Ts, rtt, off = clk.sync_cristian(nw_host, nw_port)
-        print(f"[client] initial sync: rtt={rtt*1000:.3f} ms, offset_applied={off:.6f}s")
-    except Exception as e:
-        print(f"[client] WARNING: initial sync failed ({e}), continuing with unsynced clock.")
+        ts, rtt = cristian_sync(args.nw_host, args.nw_port)
+        clock.set(ts + rtt / 2.0)
+        sync_interval = next_interval_seconds(args.epsilon, rtt, args.rho)
+    except Exception:
+        sync_interval = 1.0  # try again soon if first sync fails
 
-    # Decide when to re-sync. We keep the drift contribution safely below epsilon_max.
-    # Simple policy: if drift_error_bound() >= 0.8 * epsilon_max, re-sync.
-    end_time = now() + d
+    next_sync_at = time.time() + sync_interval
+    next_log_at = math.floor(time.time()) + 1  # log on whole-second ticks
 
-    # CSV writer
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["actual_time", "local_time"])
+    while time.time() < end:
+        now_real = time.time()
 
-        next_record = math.floor(now()) + 1  # align records to next second boundary
-        while now() < end_time:
-            # Periodic drift check
-            if clk.drift_error_bound() >= 0.8 * epsilon_max:
-                try:
-                    Ts, rtt, off = clk.sync_cristian(nw_host, nw_port)
-                    print(f"[client] sync: rtt={rtt*1000:.3f} ms, offset_applied={off:.6f}s")
-                except Exception as e:
-                    print(f"[client] sync failed: {e}")
+        # 1 Hz logging on real time
+        if now_real >= next_log_at:
+            write_csv_row(csv_path, now_real, clock.now(), header_written)
+            next_log_at += 1
 
-            # Record once per system second
-            t = now()
-            if t >= next_record:
-                actual_time = t
-                local_time = clk.read()
-                # Print to 3 decimals (milliseconds) with comma delimiter, no extra spaces
-                writer.writerow([f"{actual_time:.3f}", f"{local_time:.3f}"])
-                next_record += 1
+        # Periodic resync based on ε, ρ, and observed RTT
+        if now_real >= next_sync_at:
+            try:
+                ts, rtt = cristian_sync(args.nw_host, args.nw_port)
+                clock.set(ts + rtt / 2.0)
+                sync_interval = next_interval_seconds(args.epsilon, rtt, args.rho)
+            except Exception:
+                sync_interval = 1.0  # transient failure; retry soon
+            next_sync_at = time.time() + sync_interval
 
-            # Sleep a bit to reduce busy-waiting
-            time.sleep(0.01)
+        time.sleep(0.005)  # light idle
 
-    print(f"[client] wrote CSV to {out_csv}")
+    # Final flush if we ended exactly on a tick
+    now_real = time.time()
+    if math.isclose(now_real, next_log_at, abs_tol=0.01):
+        write_csv_row(csv_path, now_real, clock.now(), header_written)
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--d", type=int, required=True, help="duration to run (seconds)")
-    p.add_argument("--epsilon", type=float, required=True, help="maximum tolerable error (seconds)")
-    p.add_argument("--rho", type=float, required=True, help="clock drift ratio (unitless)")
-    p.add_argument("--nw-host", default="127.0.0.1")
-    p.add_argument("--nw-port", type=int, default=5000)
-    p.add_argument("--out", default="output.csv")
-    args = p.parse_args()
-    run_client(args.d, args.epsilon, args.rho, args.nw_host, args.nw_port, args.out)
+    main()
