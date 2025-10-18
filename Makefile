@@ -8,7 +8,7 @@ run_project:
 	python3 time_server.py &
 	python3 network.py &
 	sleep 2
-	python3 client.py --d $(d) --epsilon $(epsilon_max) --rho $(rho) --csv output.csv
+	python3 client.py --d $(d) --epsilon $(epsilon_max) --rho $(rho)
 	@make clean
 
 clean:

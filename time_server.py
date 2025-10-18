@@ -5,33 +5,22 @@ import json
 import time
 
 HOST = "127.0.0.1"
-PORT = 8090   # Make sure your network.py forwards to this port
+PORT = 8090  # keep your port; just match it in network.py later
 
-def handle_client(conn: socket.socket, addr):
-    try:
-        f_in = conn.makefile("rb")
-        f_out = conn.makefile("wb")
-        while True:
-            line = f_in.readline()
-            if not line:
-                break  # client closed the connection
-            # We ignore request contents; just return current Unix time
-            now = time.time()
-            resp = {"type": "time_resp", "server_time": now}
-            f_out.write((json.dumps(resp) + "\n").encode("utf-8"))
-            f_out.flush()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+def handle_client(conn, addr):
+    data = conn.recv(1024)  # we don't really care what the client sent
+    # Current server time (Unix epoch seconds, float)
+    resp = {"type": "time_resp", "server_time": time.time()}
+    # Send one newline-terminated JSON line
+    conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+    conn.close()
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
     s.listen()
-    print(f"[TS] Listening on {HOST}:{PORT}")
+    print("Server is listening...")
 
     while True:
         conn, addr = s.accept()
+        # start a new thread for each client
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
