@@ -65,7 +65,10 @@ def generate_csv(now, set_to, duration: int, epsilon: float, rho: float,
 
     sync_interval = next_interval(epsilon, rtt, rho)
     next_sync_at = time.time() + sync_interval
-    next_log_at = math.floor(time.time()) + 1  # 1 Hz logging on real time
+    start_tick = math.floor(time.time()) + 1
+    while time.time() < start_tick:
+        time.sleep(0.001)
+    next_log_at = start_tick
 
     while time.time() < end_at:
         now_real = time.time()
