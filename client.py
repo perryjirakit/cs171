@@ -35,7 +35,7 @@ def cristian_sync(now, set_to, nw_host: str, nw_port: int) -> float:
 
     Ts = float(resp["server_time"])
     rtt = t2 - t0
-    # Estimate server time at receipt and set local clock to that
+
     set_to(Ts + rtt / 2.0)
     return rtt
 
@@ -47,13 +47,11 @@ def generate_csv(now, set_to, duration: int, epsilon: float, rho: float,
 
     end_at = time.time() + duration
 
-    # First sync ASAP (if it fails, we’ll retry soon)
     try:
         rtt = cristian_sync(now, set_to, nw_host, nw_port)
     except Exception:
-        rtt = 0.0  # fallback so we try again quickly
+        rtt = 0.0
 
-    # compute initial next-sync time
     def next_interval(eps, rtt_val, rho_val):
         delta_net = rtt_val / 2.0
         margin = eps - delta_net
@@ -70,19 +68,31 @@ def generate_csv(now, set_to, duration: int, epsilon: float, rho: float,
         time.sleep(0.001)
     next_log_at = start_tick
 
+    first_row_pending = True
+
     while time.time() < end_at:
         now_real = time.time()
 
-        # Log once per real second
         if now_real >= next_log_at:
             if not header_written:
                 csv_path.write_text("actual_time,local_time\n", encoding="utf-8")
                 header_written = True
+
+            if first_row_pending:
+                try:
+                    rtt = cristian_sync(now, set_to, nw_host, nw_port)
+                    sync_interval = next_interval(epsilon, rtt, rho)
+                    next_sync_at = time.time() + sync_interval
+                except Exception:
+                    pass
+                first_row_pending = False
+
             with csv_path.open("a", encoding="utf-8") as f:
-                f.write(f"{now_real:.3f},{now():.3f}\n")
+                actual = time.time()
+                local  = now()
+                f.write(f"{actual:.3f},{local:.3f}\n")
             next_log_at += 1
 
-        # Perform sync when due
         if now_real >= next_sync_at:
             try:
                 rtt = cristian_sync(now, set_to, nw_host, nw_port)

@@ -3,14 +3,13 @@ import threading
 import time
 import random
 
-# NW proxy address (what the client connects to)
+# NW proxy address
 HOST = "127.0.0.1"
 PORT = 5001
 
-# Time server address (where NW forwards)
+# Time server address
 TS_HOST = "127.0.0.1"
 TS_PORT = 8090
-
 
 def handle_client(conn, addr):
     client_req = conn.recv(1024)

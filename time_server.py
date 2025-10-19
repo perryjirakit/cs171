@@ -5,13 +5,11 @@ import json
 import time
 
 HOST = "127.0.0.1"
-PORT = 8090  # keep your port; just match it in network.py later
+PORT = 8090
 
 def handle_client(conn, addr):
-    data = conn.recv(1024)  # we don't really care what the client sent
-    # Current server time (Unix epoch seconds, float)
+    data = conn.recv(1024)
     resp = {"type": "time_resp", "server_time": time.time()}
-    # Send one newline-terminated JSON line
     conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
     conn.close()
 
